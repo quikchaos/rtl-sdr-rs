@@ -40,7 +40,6 @@ pub struct RtlSdr {
     corr: i32, // PPM
     force_bt: bool,
     force_ds: bool,
-    fir: [i32; FIR_LEN],
 }
 
 impl RtlSdr {
@@ -59,7 +58,6 @@ impl RtlSdr {
             corr: 0,
             force_bt: false,
             force_ds: false,
-            fir: *DEFAULT_FIR,
         }
     }
 
@@ -101,6 +99,9 @@ impl RtlSdr {
 
         self.tuner = tuner;
         self.tuner.set_xtal_freq(self.get_tuner_xtal_freq())?;
+        if let Ok(info) = self.tuner.get_info() {
+            log::info!("Initialized tuner: {} ({})", info.name, info.id);
+        }
 
         // disable Zero-IF mode
         self.handle.demod_write_reg(1, 0xb1, 0x1a, 1)?;
@@ -221,8 +222,7 @@ impl RtlSdr {
         }
 
         // Compute exact sample rate
-        let rsamp_ratio =
-            (self.xtal as u128 * 2_u128.pow(22) / rate as u128) & 0x0ffffffc;
+        let rsamp_ratio = (self.xtal as u128 * 2_u128.pow(22) / rate as u128) & 0x0ffffffc;
         info!(
             "set_sample_rate: rate: {}, xtal: {}, rsamp_ratio: {}",
             rate, self.xtal, rsamp_ratio
@@ -410,6 +410,16 @@ impl RtlSdr {
         self.handle.bulk_transfer(buf)
     }
 
+    #[cfg(not(test))]
+    pub fn raw_usb_ptrs(
+        &self,
+    ) -> (
+        *mut libusb1_sys::libusb_device_handle,
+        *mut libusb1_sys::libusb_context,
+    ) {
+        self.handle.raw_usb_ptrs()
+    }
+
     fn init_baseband(&self) -> Result<()> {
         // Init baseband
         // info!("Initialize USB");
@@ -518,8 +528,7 @@ impl RtlSdr {
             true => 0x18,
             false => 0x10,
         };
-        self.handle
-            .demod_write_reg(1, 0x01, val, 1).map(|_| ())
+        self.handle.demod_write_reg(1, 0x01, val, 1).map(|_| ())
     }
 
     pub fn set_fir(&self, fir: &[i32; FIR_LEN]) -> Result<()> {
@@ -550,9 +559,9 @@ impl RtlSdr {
             tmp[8 + i * 3 / 2 + 2] = val1 as u8;
         }
 
-        for i in 0..TMP_LEN {
+        for (i, &val) in tmp.iter().enumerate() {
             self.handle
-                .demod_write_reg(1, 0x1c + i as u16, tmp[i] as u16, 1)?;
+                .demod_write_reg(1, 0x1c + i as u16, val as u16, 1)?;
         }
         Ok(())
     }

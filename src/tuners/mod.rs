@@ -20,7 +20,7 @@ pub struct TunerInfo {
     // pub gains: Vec<i8>,
 }
 
-pub trait Tuner: std::fmt::Debug {
+pub trait Tuner: std::fmt::Debug + Send {
     fn init(&mut self, handle: &Device) -> Result<()>;
     fn get_info(&self) -> Result<TunerInfo>;
     fn get_gains(&self) -> Result<Vec<i32>>;

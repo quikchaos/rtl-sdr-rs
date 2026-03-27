@@ -77,8 +77,7 @@ impl Device {
         let data_slice = if len == 1 { &data[1..2] } else { &data };
         let index = (block << 8) | 0x10;
         // info!("write_reg addr: {:x} index: {:x} data: {:x?} data slice: {}", addr, index, data, data_slice.len());
-        self
-            .handle
+        self.handle
             .write_control(CTRL_OUT, 0, addr, index, data_slice, CTRL_TIMEOUT)
     }
 
@@ -142,6 +141,16 @@ impl Device {
         self.handle.read_bulk(0x81, buf, Duration::ZERO)
     }
 
+    #[cfg(not(test))]
+    pub fn raw_usb_ptrs(
+        &self,
+    ) -> (
+        *mut libusb1_sys::libusb_device_handle,
+        *mut libusb1_sys::libusb_context,
+    ) {
+        self.handle.raw_usb_ptrs()
+    }
+
     pub fn read_eeprom(&self, data: &mut [u8], offset: u8, len: usize) -> Result<usize> {
         assert!((len + offset as usize) <= EEPROM_SIZE);
         self.write_array(BLOCK_IIC, EEPROM_ADDR, &[offset], 1)?;
@@ -179,15 +188,13 @@ impl Device {
 
     pub fn read_array(&self, block: u16, addr: u16, arr: &mut [u8], _len: u8) -> Result<usize> {
         let index: u16 = block << 8;
-        self
-            .handle
+        self.handle
             .read_control(CTRL_IN, 0, addr, index, arr, CTRL_TIMEOUT)
     }
 
     pub fn write_array(&self, block: u16, addr: u16, arr: &[u8], len: usize) -> Result<usize> {
         let index: u16 = (block << 8) | 0x10;
-        self
-            .handle
+        self.handle
             .write_control(CTRL_OUT, 0, addr, index, &arr[..len], CTRL_TIMEOUT)
     }
 }

@@ -7,9 +7,11 @@ use std::time::Duration;
 use crate::error::Result;
 use crate::error::RtlsdrError::RtlsdrErr;
 use crate::DeviceId;
+use libusb1_sys::{libusb_context, libusb_device_handle};
 use log::info;
 use rusb::{Context, UsbContext};
 
+#[allow(dead_code)]
 enum UsbSelector<'a> {
     Index(usize),
     Serial(&'a str),
@@ -19,6 +21,7 @@ enum UsbSelector<'a> {
 pub struct DeviceHandle {
     handle: rusb::DeviceHandle<Context>,
 }
+#[allow(dead_code)]
 impl DeviceHandle {
     pub fn open(device_id: DeviceId) -> Result<Self> {
         let mut context = Context::new()?;
@@ -157,6 +160,12 @@ impl DeviceHandle {
 
     pub fn read_bulk(&self, endpoint: u8, buf: &mut [u8], timeout: Duration) -> Result<usize> {
         Ok(self.handle.read_bulk(endpoint, buf, timeout)?)
+    }
+
+    /// Return raw libusb pointers for use with the low-level async transfer API.
+    /// Both pointers are valid as long as this `DeviceHandle` is alive.
+    pub fn raw_usb_ptrs(&self) -> (*mut libusb_device_handle, *mut libusb_context) {
+        (self.handle.as_raw(), self.handle.context().as_raw())
     }
 
     pub fn get_usb_strings(&self) -> Result<(Option<String>, Option<String>, Option<String>)> {
