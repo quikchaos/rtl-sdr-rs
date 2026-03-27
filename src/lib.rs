@@ -5,20 +5,19 @@
 //! # rtlsdr Library
 //! Library for interfacing with an RTL-SDR device.
 
-#[cfg(not(test))]
-mod async_transfer;
 mod device;
 pub mod error;
 mod rtlsdr;
 mod tuners;
 
-use device::Device;
+use device::{Device, SharedReaderHandle};
 use error::{Result, RtlsdrError};
 use rtlsdr::RtlSdr as Sdr;
 use rusb::{Context, DeviceHandle, DeviceList, UsbContext};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
+use std::time::Duration;
 use tuners::r82xx::{R820T_TUNER_ID, R828D_TUNER_ID};
 
 pub struct TunerId;
@@ -47,6 +46,8 @@ pub struct AsyncReadControlHandle {
 
 enum AsyncReadControl {
     Tune(u32),
+    SetGain(TunerGain),
+    SetSampleRate(u32),
 }
 
 impl AsyncReadHandle {
@@ -79,6 +80,18 @@ impl AsyncReadHandle {
             .send(AsyncReadControl::Tune(center_freq))
             .map_err(|_| RtlsdrError::RtlsdrErr("async control channel closed".to_string()))
     }
+
+    pub fn set_gain(&self, gain: TunerGain) -> Result<()> {
+        self.ctrl_tx
+            .send(AsyncReadControl::SetGain(gain))
+            .map_err(|_| RtlsdrError::RtlsdrErr("async control channel closed".to_string()))
+    }
+
+    pub fn set_sample_rate(&self, rate: u32) -> Result<()> {
+        self.ctrl_tx
+            .send(AsyncReadControl::SetSampleRate(rate))
+            .map_err(|_| RtlsdrError::RtlsdrErr("async control channel closed".to_string()))
+    }
 }
 
 impl AsyncReadControlHandle {
@@ -93,6 +106,18 @@ impl AsyncReadControlHandle {
     pub fn tune(&self, center_freq: u32) -> Result<()> {
         self.ctrl_tx
             .send(AsyncReadControl::Tune(center_freq))
+            .map_err(|_| RtlsdrError::RtlsdrErr("async control channel closed".to_string()))
+    }
+
+    pub fn set_gain(&self, gain: TunerGain) -> Result<()> {
+        self.ctrl_tx
+            .send(AsyncReadControl::SetGain(gain))
+            .map_err(|_| RtlsdrError::RtlsdrErr("async control channel closed".to_string()))
+    }
+
+    pub fn set_sample_rate(&self, rate: u32) -> Result<()> {
+        self.ctrl_tx
+            .send(AsyncReadControl::SetSampleRate(rate))
             .map_err(|_| RtlsdrError::RtlsdrErr("async control channel closed".to_string()))
     }
 }
@@ -285,6 +310,18 @@ impl RtlSdr {
                                 return;
                             }
                         }
+                        AsyncReadControl::SetGain(gain) => {
+                            if let Err(e) = sdr.set_tuner_gain(gain) {
+                                let _ = tx.try_send(Err(e));
+                                return;
+                            }
+                        }
+                        AsyncReadControl::SetSampleRate(rate) => {
+                            if let Err(e) = sdr.set_sample_rate(rate) {
+                                let _ = tx.try_send(Err(e));
+                                return;
+                            }
+                        }
                     }
                 }
 
@@ -316,16 +353,20 @@ impl RtlSdr {
         })
     }
 
-    /// Start a true concurrent multi-transfer USB streaming loop.
+    /// Start a concurrent multi-transfer USB streaming loop.
     ///
-    /// Unlike `into_async_reader` (which does one `read_sync` at a time),
-    /// this method submits `buf_num` libusb bulk transfers simultaneously and
-    /// each completion callback immediately resubmits its transfer — exactly
-    /// mirroring librtlsdr's `rtlsdr_read_async`.  The RTL-SDR hardware FIFO
-    /// never sees a gap, so it cannot overflow between transfers.
+    /// Spawns `buf_num` reader threads (default 15), each blocking on
+    /// `rusb::DeviceHandle::read_bulk` simultaneously.  Because all threads
+    /// share the same underlying USB handle via `Arc`, the OS/libusb sees
+    /// `buf_num` bulk transfers in-flight at once — the same concurrency
+    /// guarantee as librtlsdr's `rtlsdr_read_async` with N=`buf_num`
+    /// transfers, achieved with pure safe Rust and no raw FFI.
+    ///
+    /// Tune commands sent via the returned handle's `tune()` method are
+    /// processed by a dedicated control thread that calls `set_center_freq`
+    /// without pausing the reader threads.
     ///
     /// Returns the same `AsyncReadHandle` iterator as `into_async_reader`.
-    #[cfg(not(test))]
     pub fn into_multi_transfer_reader(
         self,
         buf_num: usize,
@@ -349,40 +390,89 @@ impl RtlSdr {
             )));
         }
 
-        // Channel: capacity = buf_num * 4 gives the consumer headroom without
-        // building up latency.  When full, the callback drops the chunk rather
-        // than stalling the event loop.
+        // Channel: buf_num * 4 slots give the consumer headroom.  When full,
+        // reader threads drop chunks rather than blocking (which would stall
+        // that thread's resubmission and create the very FIFO gap we prevent).
         let (tx, rx) = mpsc::sync_channel::<Result<Vec<u8>>>(buf_num * 4);
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<AsyncReadControl>();
         let stop = Arc::new(AtomicBool::new(false));
         let dropped = Arc::new(AtomicU64::new(0));
-        let stop_thread = stop.clone();
+        let dropped_handle = Arc::clone(&dropped);
 
+        // Shared handle — Arc lets N threads call read_bulk concurrently.
+        // rusb::DeviceHandle implements Send + Sync (libusb is thread-safe for
+        // concurrent bulk transfers on the same handle).
+        let shared = self.sdr.shared_reader_handle();
+
+        // The full RtlSdr moves into the control thread for exclusive tuning.
+        let mut sdr = self;
+
+        let stop_ctrl = stop.clone();
         let thread = thread::spawn(move || {
-            let mut sdr = self;
+            // Spawn N reader threads.  Each blocks on read_bulk with a short
+            // timeout so it can notice the stop flag promptly on shutdown.
+            let reader_threads: Vec<_> = (0..buf_num)
+                .map(|_| {
+                    let handle: SharedReaderHandle = shared.clone();
+                    let tx = tx.clone();
+                    let stop_r = stop_ctrl.clone();
+                    let dropped_ctr = dropped.clone();
+                    thread::spawn(move || {
+                        let mut buf = vec![0u8; buf_len];
+                        loop {
+                            if stop_r.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            match handle.read_bulk(&mut buf, Duration::from_millis(100)) {
+                                Ok(0) => continue,
+                                Ok(n) => {
+                                    if tx.try_send(Ok(buf[..n].to_vec())).is_err() {
+                                        dropped_ctr.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
+                                Err(RtlsdrError::Usb(rusb::Error::Timeout)) => continue,
+                                Err(RtlsdrError::Usb(rusb::Error::Interrupted)) => continue,
+                                Err(e) => {
+                                    let _ = tx.try_send(Err(e));
+                                    break;
+                                }
+                            }
+                        }
+                    })
+                })
+                .collect();
 
-            // Obtain raw libusb pointers while the device handle is alive.
-            // Both pointers remain valid until `sdr` is dropped at the end of
-            // this closure.
-            let (dev_handle, ctx) = sdr.sdr.raw_usb_ptrs();
-
-            // Process any pending tune commands before starting (unlikely but
-            // safe); in the multi-transfer path we cannot retune mid-stream
-            // (would require pausing the event loop), so drain once up-front.
-            while let Ok(cmd) = ctrl_rx.try_recv() {
-                match cmd {
-                    AsyncReadControl::Tune(freq) => {
-                        if let Err(e) = sdr.set_center_freq(freq) {
-                            let _ = tx.try_send(Err(e));
-                            return;
+            // Control loop: handle tune commands while readers run.
+            loop {
+                if stop_ctrl.load(Ordering::Relaxed) {
+                    break;
+                }
+                match ctrl_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(AsyncReadControl::Tune(freq)) => {
+                        if let Err(e) = sdr.sdr.set_center_freq(freq) {
+                            log::warn!("RTL-SDR retune to {} Hz failed: {}", freq, e);
                         }
                     }
+                    Ok(AsyncReadControl::SetGain(gain)) => {
+                        if let Err(e) = sdr.set_tuner_gain(gain) {
+                            log::warn!("RTL-SDR set gain failed: {}", e);
+                        }
+                    }
+                    Ok(AsyncReadControl::SetSampleRate(rate)) => {
+                        if let Err(e) = sdr.set_sample_rate(rate) {
+                            log::warn!("RTL-SDR set sample rate to {} failed: {}", rate, e);
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
                 }
             }
 
-            // Run the blocking event loop — returns when stop_thread is set
-            // or the device is lost.
-            async_transfer::run(ctx, dev_handle, buf_num, buf_len, stop_thread, tx);
+            // Shutdown: signal readers and wait for all to exit.
+            stop_ctrl.store(true, Ordering::Relaxed);
+            for t in reader_threads {
+                let _ = t.join();
+            }
 
             let _ = sdr.close();
         });
@@ -391,7 +481,7 @@ impl RtlSdr {
             rx,
             ctrl_tx,
             stop,
-            dropped,
+            dropped: dropped_handle,
             thread: Some(thread),
         })
     }

@@ -18,6 +18,7 @@ use crate::DeviceId;
 use byteorder::{ByteOrder, LittleEndian};
 /// Low-level io functions for interfacing with rusb(libusb)
 use log::{error, info};
+use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(test)]
@@ -27,20 +28,51 @@ pub fn is_known_device(vid: u16, pid: u16) -> bool {
     DEVICE_LOOKUP.contains(&(vid, pid))
 }
 
+/// A cloneable handle for concurrent bulk reads across multiple threads.
+///
+/// Obtained via [`Device::shared_reader_handle`].  Each clone wraps the same
+/// underlying USB handle — all copies submit independent bulk transfers that
+/// are in-flight simultaneously, exactly as librtlsdr's `rtlsdr_read_async`
+/// does with N concurrent `libusb_transfer` structs.
+pub(crate) struct SharedReaderHandle(Arc<DeviceHandle>);
+
+impl SharedReaderHandle {
+    pub fn read_bulk(&self, buf: &mut [u8], timeout: Duration) -> Result<usize> {
+        self.0.read_bulk(0x81, buf, timeout)
+    }
+}
+
+impl Clone for SharedReaderHandle {
+    fn clone(&self) -> Self {
+        SharedReaderHandle(Arc::clone(&self.0))
+    }
+}
+
 #[derive(Debug)]
 pub struct Device {
-    handle: DeviceHandle,
+    handle: Arc<DeviceHandle>,
 }
 
 impl Device {
     pub fn new(device_id: DeviceId) -> Result<Device> {
         Ok(Device {
-            handle: DeviceHandle::open(device_id)?,
+            handle: Arc::new(DeviceHandle::open(device_id)?),
         })
     }
 
+    /// Return a cloneable reader handle that shares the underlying USB handle.
+    ///
+    /// All clones submit independent `read_bulk` calls simultaneously, keeping
+    /// N USB bulk transfers in-flight at once with no gaps between them.
+    pub(crate) fn shared_reader_handle(&self) -> SharedReaderHandle {
+        SharedReaderHandle(Arc::clone(&self.handle))
+    }
+
     pub fn claim_interface(&mut self, iface: u8) -> Result<()> {
-        self.handle.claim_interface(iface)
+        // Called only during initialisation before any handle sharing.
+        Arc::get_mut(&mut self.handle)
+            .expect("claim_interface called after handle was shared")
+            .claim_interface(iface)
     }
 
     pub fn test_write(&mut self) -> Result<()> {
@@ -48,7 +80,9 @@ impl Device {
         let len: usize = self.write_reg(BLOCK_USB, USB_SYSCTL, 0x09, 1)?;
         if len == 0 {
             info!("Resetting device...");
-            self.handle.reset()?;
+            Arc::get_mut(&mut self.handle)
+                .expect("reset called after handle was shared")
+                .reset()?;
         }
         Ok(())
     }
@@ -76,7 +110,6 @@ impl Device {
         let data: [u8; 2] = val.to_be_bytes();
         let data_slice = if len == 1 { &data[1..2] } else { &data };
         let index = (block << 8) | 0x10;
-        // info!("write_reg addr: {:x} index: {:x} data: {:x?} data slice: {}", addr, index, data, data_slice.len());
         self.handle
             .write_control(CTRL_OUT, 0, addr, index, data_slice, CTRL_TIMEOUT)
     }
@@ -93,10 +126,7 @@ impl Device {
             &mut data,
             CTRL_TIMEOUT,
         ) {
-            Ok(n) => {
-                // info!("demod_read_reg got {} bytes: [{:#02x}, {:#02x}] value: {:x}", n, data[0], data[1], BigEndian::read_u16(&data));
-                n
-            }
+            Ok(n) => n,
             Err(e) => {
                 error!(
                     "demod_read_reg failed: {} page: {:#02x} addr: {:#02x}",
@@ -139,16 +169,6 @@ impl Device {
 
     pub fn bulk_transfer(&self, buf: &mut [u8]) -> Result<usize> {
         self.handle.read_bulk(0x81, buf, Duration::ZERO)
-    }
-
-    #[cfg(not(test))]
-    pub fn raw_usb_ptrs(
-        &self,
-    ) -> (
-        *mut libusb1_sys::libusb_device_handle,
-        *mut libusb1_sys::libusb_context,
-    ) {
-        self.handle.raw_usb_ptrs()
     }
 
     pub fn read_eeprom(&self, data: &mut [u8], offset: u8, len: usize) -> Result<usize> {

@@ -4,8 +4,8 @@
 
 use super::{DirectSampleMode, TunerGain};
 use crate::device::{
-    Device, BLOCK_SYS, BLOCK_USB, DEMOD_CTL, DEMOD_CTL_1, EEPROM_SIZE, GPD, GPO, GPOE, USB_EPA_CTL,
-    USB_EPA_MAXPKT, USB_SYSCTL,
+    Device, SharedReaderHandle, BLOCK_SYS, BLOCK_USB, DEMOD_CTL, DEMOD_CTL_1, EEPROM_SIZE, GPD,
+    GPO, GPOE, USB_EPA_CTL, USB_EPA_MAXPKT, USB_SYSCTL,
 };
 use crate::error::Result;
 use crate::error::RtlsdrError::RtlsdrErr;
@@ -410,14 +410,8 @@ impl RtlSdr {
         self.handle.bulk_transfer(buf)
     }
 
-    #[cfg(not(test))]
-    pub fn raw_usb_ptrs(
-        &self,
-    ) -> (
-        *mut libusb1_sys::libusb_device_handle,
-        *mut libusb1_sys::libusb_context,
-    ) {
-        self.handle.raw_usb_ptrs()
+    pub(crate) fn shared_reader_handle(&self) -> SharedReaderHandle {
+        self.handle.shared_reader_handle()
     }
 
     fn init_baseband(&self) -> Result<()> {
